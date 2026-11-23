@@ -2,12 +2,12 @@ use crate::{
     config,
     jmap::{EmailKeyword, Id},
     local,
-    remote::{AvailableMailboxRoles, Email, Mailbox, Mailboxes},
+    remote::{Email, Mailboxes},
 };
 use log::debug;
 use serde_json::Value;
 
-use std::{collections::HashMap, collections::HashSet, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf};
 
 pub struct Create<'a> {
     pub path: PathBuf,

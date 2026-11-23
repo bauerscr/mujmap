@@ -113,8 +113,9 @@ pub struct AccountCapabilities {
     // The spec is ambiguous whether this cap should exist
     #[serde(rename = "urn:ietf:params:jmap:core")]
     pub core: Option<EmptyCapabilities>,
+    /// Absent for accounts that don't support mail, e.g. a contacts-only account.
     #[serde(rename = "urn:ietf:params:jmap:mail")]
-    pub mail: MailAccountCapabilities,
+    pub mail: Option<MailAccountCapabilities>,
 }
 
 #[derive(Debug, Deserialize)]
