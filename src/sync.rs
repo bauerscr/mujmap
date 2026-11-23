@@ -326,9 +326,23 @@ pub fn sync(
         stdout.reset().context(LogSnafu {})?;
         stdout.flush().context(LogSnafu {})?;
 
+        // Don't exceed the number of concurrent requests the server is willing to accept.
+        let max_concurrent_requests =
+            remote.session.capabilities.core.max_concurrent_requests as usize;
+        let num_threads = config
+            .concurrent_downloads
+            .min(max_concurrent_requests)
+            .max(1);
+        if num_threads < config.concurrent_downloads {
+            debug!(
+                "Limiting concurrent downloads to {} (server's maxConcurrentRequests)",
+                num_threads
+            );
+        }
+
         let pb = ProgressBar::new(new_emails_missing_from_cache.len() as u64);
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(config.concurrent_downloads)
+            .num_threads(num_threads)
             .build()
             .context(CreateDownloadThreadPoolSnafu {})?;
         let result: Result<Vec<_>, Error> = pool.install(|| {
@@ -336,11 +350,23 @@ pub fn sync(
                 .into_par_iter()
                 .map(|new_email| {
                     let mut retry_count = 0;
+                    let mut rate_limit_count = 0;
                     loop {
                         match download(new_email, &remote, &cache, config.convert_dos_to_unix) {
                             Ok(_) => {
                                 pb.inc(1);
                                 return Ok(());
+                            }
+                            Err(Error::DownloadRemoteEmail { source })
+                                if rate_limit_count < MAX_RATE_LIMIT_WAITS
+                                    && source.rate_limit_wait().is_some() =>
+                            {
+                                // The server asked us to slow down; this doesn't count as a
+                                // failed try.
+                                rate_limit_count += 1;
+                                let wait = source.rate_limit_wait().unwrap();
+                                debug!("Rate limited, waiting {:?}: {}", wait, source);
+                                std::thread::sleep(wait);
                             }
                             Err(e) => {
                                 // Try again.
@@ -666,6 +692,10 @@ pub fn sync(
 
     Ok(())
 }
+
+/// Maximum number of times to wait out a server rate limit for a single email download before
+/// treating it as a regular failure.
+const MAX_RATE_LIMIT_WAITS: usize = 100;
 
 fn download(
     new_email: &NewEmail,

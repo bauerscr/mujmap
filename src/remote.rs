@@ -76,6 +76,22 @@ pub enum Error {
     #[snafu(display("Could not read Email blob from server: {}", source))]
     ReadEmailBlobError { source: ureq::Error },
 
+    #[snafu(display(
+        "Could not read Email blob from server: {}: status code {}: {}",
+        url,
+        status,
+        detail
+    ))]
+    ReadEmailBlobStatus {
+        url: String,
+        status: u16,
+        detail: String,
+        /// Whether the server rejected the request because of a rate or concurrency limit.
+        rate_limited: bool,
+        /// Value of the `Retry-After` header, if any.
+        retry_after: Option<Duration>,
+    },
+
     #[snafu(display("Could not find an archive mailbox"))]
     NoArchive {},
 
@@ -101,6 +117,21 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// If the server refused the request because of a rate or concurrency limit, how long to wait
+    /// before trying again.
+    pub fn rate_limit_wait(&self) -> Option<Duration> {
+        match self {
+            Error::ReadEmailBlobStatus {
+                rate_limited: true,
+                retry_after,
+                ..
+            } => Some(retry_after.unwrap_or(Duration::from_secs(1))),
+            _ => None,
+        }
+    }
+}
 
 struct HttpWrapper {
     /// Value of HTTP Authorization header.
@@ -140,11 +171,40 @@ impl HttpWrapper {
     }
 
     fn get_reader(&self, url: &str) -> Result<impl Read + Send + use<>> {
-        Ok(self
-            .apply_authorization(self.agent.get(url))
-            .call()
-            .context(ReadEmailBlobSnafu {})?
-            .into_reader())
+        match self.apply_authorization(self.agent.get(url)).call() {
+            Ok(r) => Ok(r.into_reader()),
+            Err(ureq::Error::Status(status, r)) => {
+                let retry_after = r
+                    .header("Retry-After")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                let body = r.into_string().unwrap_or_default();
+                // Servers may answer with an RFC 7807 problem details object.
+                let problem: Option<Value> = serde_json::from_str(&body).ok();
+                let problem_field = |field: &str| {
+                    problem
+                        .as_ref()
+                        .and_then(|p| p.get(field))
+                        .and_then(|v| v.as_str())
+                };
+                // Stalwart reports exceeding `maxConcurrentRequests` as a 400 JMAP limit error
+                // rather than a 429.
+                let rate_limited = status == 429
+                    || (problem_field("type") == Some("urn:ietf:params:jmap:error:limit")
+                        && problem_field("limit") == Some("maxConcurrentRequests"));
+                let detail = problem_field("detail")
+                    .map(String::from)
+                    .unwrap_or_else(|| body.clone());
+                Err(Error::ReadEmailBlobStatus {
+                    url: url.to_string(),
+                    status,
+                    detail,
+                    rate_limited,
+                    retry_after,
+                })
+            }
+            Err(e) => Err(e).context(ReadEmailBlobSnafu {}),
+        }
     }
 
     fn post_string<D: DeserializeOwned>(&self, url: &str, body: &str) -> Result<D> {
@@ -187,6 +247,17 @@ pub struct Remote {
     session_url: String,
     /// The latest session object returned by the server.
     pub session: jmap::Session,
+}
+
+fn encode_basic(username: &str, password: &str) -> String {
+    let safe_username = match username.find(':') {
+        Some(idx) => &username[..idx],
+        None => username,
+    };
+    format!(
+        "Basic {}",
+        base64::encode(format!("{}:{}", safe_username, password))
+    )
 }
 
 impl Remote {
@@ -263,29 +334,36 @@ impl Remote {
 
         match agent.get(session_url).call() {
             Ok(r) => {
-                // Server returned success without authentication. Surprising, but valid.
+                // Server returned success without authentication. Some servers (e.g. Stalwart)
+                // return an anonymous session with no accounts in this case, so only accept it if
+                // it actually has a primary mail account; otherwise authenticate and try again.
                 let session_url = r.get_url().to_string();
-                let session: jmap::Session = r.into_json().context(ResponseSnafu {})?;
-                debug!("Acquired fresh state: {:?}", session);
-                Ok(Self {
-                    http_wrapper: HttpWrapper::new(None, timeout),
-                    session_url,
-                    session,
-                })
+                let value: serde_json::Value = r.into_json().context(ResponseSnafu {})?;
+                if value
+                    .get("primaryAccounts")
+                    .and_then(|p| p.get("urn:ietf:params:jmap:mail"))
+                    .is_some()
+                {
+                    let session: jmap::Session =
+                        serde_json::from_value(value).context(DeserializeResponseSnafu {})?;
+                    debug!("Acquired fresh state: {:?}", session);
+                    return Ok(Self {
+                        http_wrapper: HttpWrapper::new(None, timeout),
+                        session_url,
+                        session,
+                    });
+                }
+
+                debug!("server returned an anonymous session, retrying with Basic auth");
+                Self::open_authenticated(
+                    &agent,
+                    &session_url,
+                    Some(encode_basic(username, password)),
+                    timeout,
+                )
             }
 
             Err(ureq::Error::Status(code, ref r)) if code == 401 => {
-                fn encode_basic(username: &str, password: &str) -> String {
-                    let safe_username = match username.find(':') {
-                        Some(idx) => &username[..idx],
-                        None => username,
-                    };
-                    format!(
-                        "Basic {}",
-                        base64::encode(format!("{}:{}", safe_username, password))
-                    )
-                }
-
                 let authorization = match r.header("WWW-Authenticate") {
                     Some(v) if v.starts_with("Basic") => {
                         debug!("server offered Basic auth");
@@ -312,24 +390,31 @@ impl Remote {
                     }
                 };
 
-                let url = r.get_url();
-
-                let mut req = agent.get(url);
-                if let Some(a) = &authorization {
-                    req = req.set("Authorization", a);
-                }
-
-                let r = req.call().context(OpenSessionSnafu { session_url })?;
-                let session: jmap::Session = r.into_json().context(ResponseSnafu {})?;
-                Ok(Self {
-                    http_wrapper: HttpWrapper::new(authorization, timeout),
-                    session_url: url.to_string(),
-                    session,
-                })
+                Self::open_authenticated(&agent, r.get_url(), authorization, timeout)
             }
 
             Err(e) => Err(e).context(OpenSessionSnafu { session_url }),
         }
+    }
+
+    fn open_authenticated(
+        agent: &ureq::Agent,
+        session_url: &str,
+        authorization: Option<String>,
+        timeout: u64,
+    ) -> Result<Self> {
+        let mut req = agent.get(session_url);
+        if let Some(a) = &authorization {
+            req = req.set("Authorization", a);
+        }
+
+        let r = req.call().context(OpenSessionSnafu { session_url })?;
+        let session: jmap::Session = r.into_json().context(ResponseSnafu {})?;
+        Ok(Self {
+            http_wrapper: HttpWrapper::new(authorization, timeout),
+            session_url: session_url.to_string(),
+            session,
+        })
     }
 
     /// Return a list of all `Email` IDs that exist on the server and a state `String` returned by
