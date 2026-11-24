@@ -152,6 +152,8 @@ pub fn compute_state_delta<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::{AvailableMailboxRoles, Mailbox};
+    use std::collections::HashSet;
     use std::path::Path;
 
     struct Fixture {

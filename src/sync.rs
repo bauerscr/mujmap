@@ -530,38 +530,38 @@ pub fn sync(
                         .update_email_tags(local_email, tags)
                         .context(UpdateLocalEmailSnafu {})?;
 
-                    // In `update' notmuch may have renamed the file on disk when setting maildir
-                    // flags, so we need to update our idea of the filename to match so that, for
-                    // new messages, we can reliably replace the symlink later.
-                    //
-                    // The `Message' might have multiple paths though (if more than one message has
-                    // the same id) so we have to get all the filenames and then find the one that
-                    // matches ours. Fortunately, our generated name (the raw JMAP mailbox.message
-                    // id) will always be a substring of notmuch's version (same name with flags
-                    // attached), so a starts-with test is enough.
-                    if let Some(new_email) = new_emails.get_mut(&remote_email.id) {
-                        if let Some(our_filename) = new_email
-                            .maildir_path
-                            .file_name()
-                            .map(|p| p.to_string_lossy())
-                        {
-                            if let Some(message) = local
-                                .get_message(&local_email.message_id)
-                                .context(GetNotmuchMessageSnafu {})?
-                            {
-                                if let Some(new_maildir_path) = message
-                                    .filenames()
-                                    .into_iter()
-                                    .filter(|f| {
-                                        f.file_name().map_or(false, |p| {
-                                            p.to_string_lossy().starts_with(&*our_filename)
-                                        })
-                                    })
-                                    .next()
-                                {
-                                    new_email.maildir_path = new_maildir_path;
-                                }
-                            }
+                }
+
+                // `update_email_tags' may have renamed files on disk when setting maildir flags,
+                // so we need to update our idea of the filenames to match so that we can reliably
+                // replace the symlinks later. This must happen only after *all* tags have been
+                // updated: if several emails share a Message-ID, notmuch treats them as one message
+                // and renames all of their files each time any of them is updated.
+                //
+                // The `Message' might have multiple paths (if more than one message has the same
+                // id) so we have to get all the filenames and then find the one that matches ours.
+                // Fortunately, our generated name (the raw JMAP mailbox.message id) will always be
+                // a prefix of notmuch's version (same name with flags attached), so a starts-with
+                // test is enough.
+                for new_email in new_emails.values_mut() {
+                    let local_email = match new_local_emails.get(&new_email.remote_email.id) {
+                        Some(e) => e,
+                        None => continue,
+                    };
+                    let our_filename = match new_email.maildir_path.file_name() {
+                        Some(f) => f.to_string_lossy().into_owned(),
+                        None => continue,
+                    };
+                    if let Some(message) = local
+                        .get_message(&local_email.message_id)
+                        .context(GetNotmuchMessageSnafu {})?
+                    {
+                        if let Some(new_maildir_path) = message.filenames().into_iter().find(|f| {
+                            f.file_name().map_or(false, |p| {
+                                p.to_string_lossy().starts_with(&our_filename)
+                            })
+                        }) {
+                            new_email.maildir_path = new_maildir_path;
                         }
                     }
                 }
