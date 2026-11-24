@@ -1,9 +1,11 @@
 use crate::args::Args;
 use crate::cache::{self, Cache};
 use crate::remote::{self, Remote};
-use crate::{config::Config, local::Local};
+use crate::config::{self, Config};
+use crate::local::Local;
 use crate::{jmap, local};
 use atty::Stream;
+use itertools::Itertools;
 use fslock::LockFile;
 use indicatif::ProgressBar;
 use log::{debug, error, warn};
@@ -75,7 +77,7 @@ pub enum Error {
     },
 
     #[snafu(display("Could not index notmuch tags: {}", source))]
-    IndexTags { source: notmuch::Error },
+    IndexTags { source: local::Error },
 
     #[snafu(display("Could not index local emails: {}", source))]
     IndexLocalEmails { source: local::Error },
@@ -239,6 +241,7 @@ pub fn sync(
         .get_mailboxes(&config.tags)
         .context(IndexMailboxesSnafu {})?;
     debug!("Got mailboxes: {:?}", mailboxes);
+    let keyword_tags = keyword_tags(&config.tags);
 
     // Query local database for all email.
     let local_emails = local.all_emails().context(IndexLocalEmailsSnafu {})?;
@@ -527,7 +530,9 @@ pub fn sync(
                     }
 
                     local
-                        .update_email_tags(local_email, tags)
+                        .update_email_tags(local_email, tags, |tag| {
+                            keyword_tags.contains(&tag) || mailboxes.ids_by_tag.contains_key(tag)
+                        })
                         .context(UpdateLocalEmailSnafu {})?;
 
                 }
@@ -624,25 +629,19 @@ pub fn sync(
 
     if !args.dry_run {
         // Ensure that for every tag, there exists a corresponding mailbox.
+        //
+        // Only tags on emails which exist solely in our maildir are considered: emails shared with
+        // other maildirs in the same notmuch database also carry the other accounts' tags.
         let tags_with_missing_mailboxes: Vec<String> = local
-            .all_tags()
+            .exclusive_tags()
             .context(IndexTagsSnafu {})?
+            .into_iter()
+            .sorted()
             .filter(|tag| {
                 let tag = tag.as_str();
                 // Any tags which *can* be mapped to a keyword do not require a mailbox.
                 // Additionally, automatic tags are never mapped to mailboxes.
-                if [
-                    "draft",
-                    "flagged",
-                    "passed",
-                    "replied",
-                    "unread",
-                    &config.tags.spam,
-                    &config.tags.important,
-                    &config.tags.phishing,
-                ]
-                .contains(&tag)
-                    || local::AUTOMATIC_TAGS.contains(tag)
+                if keyword_tags.contains(&tag) || local::AUTOMATIC_TAGS.contains(tag)
                 {
                     false
                 } else {
@@ -691,6 +690,20 @@ pub fn sync(
     }
 
     Ok(())
+}
+
+/// Tags which correspond to JMAP keywords rather than mailboxes.
+fn keyword_tags(tags_config: &config::Tags) -> [&str; 8] {
+    [
+        "draft",
+        "flagged",
+        "passed",
+        "replied",
+        "unread",
+        &tags_config.spam,
+        &tags_config.important,
+        &tags_config.phishing,
+    ]
 }
 
 /// Maximum number of times to wait out a server rate limit for a single email download before

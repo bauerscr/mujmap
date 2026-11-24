@@ -83,6 +83,8 @@ pub struct Local {
     pub mail_cur_dir: PathBuf,
     /// Notmuch search query which searches for all mail in mujmap's maildir.
     all_mail_query: String,
+    /// mujmap's maildir, as a prefix of the filenames notmuch reports.
+    db_mail_dir: PathBuf,
     /// Flag, whether or not notmuch should add maildir flags to message filenames.
     pub synchronize_maildir_flags: bool,
 }
@@ -118,6 +120,8 @@ impl Local {
                 notmuch_root: &canonical_db_path,
             })?;
 
+        let db_mail_dir = db.path().join(relative_mail_dir);
+
         // Build the query to search for all mail in our maildir.
         let all_mail_query = format!("path:\"{}/**\"", relative_mail_dir.to_str().unwrap());
 
@@ -139,6 +143,7 @@ impl Local {
             db,
             mail_cur_dir,
             all_mail_query,
+            db_mail_dir,
             synchronize_maildir_flags,
         })
     }
@@ -167,9 +172,32 @@ impl Local {
         ))
     }
 
-    /// Return all tags in the database.
-    pub fn all_tags(&self) -> Result<notmuch::Tags, notmuch::Error> {
-        self.db.all_tags()
+    /// Return all tags on emails which exist *only* in mujmap's maildir.
+    ///
+    /// The notmuch database may also contain mail from other accounts. An email which also exists
+    /// elsewhere shares its notmuch message, and therefore its tags, with those other copies, so
+    /// its tags may belong to another account and are not considered here.
+    pub fn exclusive_tags(&self) -> Result<HashSet<String>> {
+        let query = self
+            .db
+            .create_query(&self.all_mail_query)
+            .with_context(|_| CreateNotmuchQuerySnafu {
+                query: &self.all_mail_query,
+            })?;
+        query.set_omit_excluded(Exclude::False);
+        let messages = query
+            .search_messages()
+            .with_context(|_| ExecuteNotmuchQuerySnafu {
+                query: &self.all_mail_query,
+            })?;
+        Ok(messages
+            .filter(|message| {
+                message
+                    .filenames()
+                    .all(|f| f.starts_with(&self.db_mail_dir))
+            })
+            .flat_map(|message| message.tags().collect::<Vec<_>>())
+            .collect())
     }
 
     /// Begin atomic database operation.
@@ -276,10 +304,14 @@ impl Local {
             .collect()
     }
 
+    /// Set the tags of the given email to `tags`. Only tags for which `is_owned_tag` returns true
+    /// are removed; all others are left untouched, since they may belong to another account
+    /// sharing the notmuch database.
     pub fn update_email_tags(
         &self,
         email: &Email,
         tags: HashSet<&str>,
+        is_owned_tag: impl Fn(&str) -> bool,
     ) -> Result<(), notmuch::Error> {
         if let Some(message) = self.get_message(&email.message_id)? {
             // Build diffs for tags and apply them.
@@ -288,7 +320,9 @@ impl Local {
             let tags_to_remove: Vec<&str> = extant_tags
                 .iter()
                 .map(|tag| tag.as_str())
-                .filter(|tag| !tags.contains(tag) && !AUTOMATIC_TAGS.contains(tag))
+                .filter(|tag| {
+                    !tags.contains(tag) && !AUTOMATIC_TAGS.contains(tag) && is_owned_tag(tag)
+                })
                 .collect();
             let tags_to_add: Vec<&str> = tags
                 .iter()
